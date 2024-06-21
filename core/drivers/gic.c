@@ -19,6 +19,7 @@
 #include <kernel/misc.h>
 #include <kernel/panic.h>
 #include <libfdt.h>
+#include <malloc.h>
 #include <mm/core_memprot.h>
 #include <mm/core_mmu.h>
 #include <trace.h>
@@ -133,6 +134,8 @@ struct gic_data {
 	uint32_t per_cpu_group_status;
 	uint32_t per_cpu_group_modifier;
 	uint32_t per_cpu_enable;
+	uint8_t *pre_prio;
+	uint8_t *pre_tar;
 	struct itr_chip chip;
 };
 
@@ -146,6 +149,7 @@ static void gic_op_disable(struct itr_chip *chip, size_t it);
 static void gic_op_raise_pi(struct itr_chip *chip, size_t it);
 static void gic_op_raise_sgi(struct itr_chip *chip, size_t it,
 			     uint32_t cpu_mask);
+static void gic_op_release(struct itr_chip *chip, size_t it);
 static void gic_op_set_affinity(struct itr_chip *chip, size_t it,
 			uint8_t cpu_mask);
 
@@ -157,6 +161,7 @@ static const struct itr_ops gic_ops = {
 	.disable = gic_op_disable,
 	.raise_pi = gic_op_raise_pi,
 	.raise_sgi = gic_op_raise_sgi,
+	.release = gic_op_release,
 	.set_affinity = gic_op_set_affinity,
 };
 DECLARE_KEEP_PAGER(gic_ops);
@@ -530,6 +535,19 @@ static void gic_init_base_addr(paddr_t gicc_base_pa, paddr_t gicd_base_pa,
 		gd->chip.dt_get_irq = gic_dt_get_irq;
 }
 
+static void gic_init_pre_prop(void)
+{
+	struct gic_data *gd = &gic_data;
+
+	gd->pre_prio = calloc(gd->max_it + 1, sizeof(*gd->pre_prio));
+	if (!gd->pre_prio)
+		panic("Fail to allocate memory for pre_prio of gic");
+
+	gd->pre_tar = calloc(gd->max_it + 1, sizeof(*gd->pre_tar));
+	if (!gd->pre_tar)
+		panic("Faile to allocate memory for pre_tar of gic");
+}
+
 void gic_init_v3(paddr_t gicc_base_pa, paddr_t gicd_base_pa,
 		 paddr_t gicr_base_pa)
 {
@@ -537,6 +555,7 @@ void gic_init_v3(paddr_t gicc_base_pa, paddr_t gicd_base_pa,
 	size_t __maybe_unused n = 0;
 
 	gic_init_base_addr(gicc_base_pa, gicd_base_pa, gicr_base_pa);
+	gic_init_pre_prop();
 
 #if defined(CFG_WITH_ARM_TRUSTED_FW)
 	/* GIC configuration is initialized from TF-A when embedded */
@@ -786,6 +805,26 @@ static void gic_it_raise_sgi(struct gic_data *gd __maybe_unused, size_t it,
 #endif
 }
 
+static void gic_it_release(struct gic_data *gd, size_t it)
+{
+	size_t idx = it / NUM_INTS_PER_REG;
+	uint32_t mask = 1 << (it % NUM_INTS_PER_REG);
+
+	/* Assigned to group0 */
+	assert(!(io_read32(gd->gicd_base + GICD_IGROUPR(idx)) & mask));
+
+	gic_it_set_cpu_mask(gd, it, *(gd->pre_tar + it));
+	gic_it_set_prio(gd, it, *(gd->pre_prio + it));
+
+	/* Clear pending status */
+	io_write32(gd->gicd_base + GICD_ICPENDR(idx), mask);
+	/* Assign it to group1 */
+	io_setbits32(gd->gicd_base + GICD_IGROUPR(idx), mask);
+#if defined(CFG_ARM_GICV3)
+	io_clrbits32(gd->gicd_base + GICD_IGROUPMODR(idx), mask);
+#endif
+}
+
 static uint32_t gic_read_iar(struct gic_data *gd __maybe_unused)
 {
 	assert(gd == &gic_data);
@@ -836,6 +875,12 @@ static uint32_t __maybe_unused gic_it_get_target(struct gic_data *gd, size_t it)
 
 	assert(gd == &gic_data);
 	return (target & target_mask) >> target_shift;
+}
+
+static uint8_t __maybe_unused gic_it_get_prio(struct gic_data *gd, size_t it)
+{
+	assert(gd == &gic_data);
+	return io_read8(gd->gicd_base + GICD_IPRIORITYR(0) + it);
 }
 
 void gic_dump_state(void)
@@ -924,6 +969,9 @@ static void gic_op_add(struct itr_chip *chip, size_t it,
 			   gd->per_cpu_group_modifier);
 	} else {
 		gic_it_add(gd, it);
+		/* Save the cpu_mask and prio */
+		*(gd->pre_tar + it) = (uint8_t)gic_it_get_target(gd, it);
+		*(gd->pre_prio + it) = gic_it_get_prio(gd, it);
 		/* Set the CPU mask to deliver interrupts to any online core */
 		gic_it_set_cpu_mask(gd, it, 0xff);
 		gic_it_set_prio(gd, it, 0x1);
@@ -994,6 +1042,21 @@ static void gic_op_raise_sgi(struct itr_chip *chip, size_t it,
 
 	ns = BIT32(it) & gd->per_cpu_group_status;
 	gic_it_raise_sgi(gd, it, cpu_mask, ns);
+}
+
+static void gic_op_release(struct itr_chip *chip, size_t it)
+{
+	struct gic_data *gd = container_of(chip, struct gic_data, chip);
+
+	assert(gd == &gic_data);
+
+	if (it > gd->max_it)
+		panic();
+
+	if (it < GIC_SPI_BASE)
+		panic("SGIs and PPIs are not supported");
+
+	gic_it_release(gd, it);
 }
 
 static void gic_op_set_affinity(struct itr_chip *chip, size_t it,
